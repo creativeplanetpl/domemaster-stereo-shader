@@ -20,9 +20,11 @@
 
 using namespace VR;
 
+#define SEPARATION_FRAME_COUNT 30
+
 struct DomemasterStereo_ParamsStruct {
   int   camera;
-  float fov_angle; 
+  float fov_angle;
   float parallax_distance;
   float separation;
   float forward_tilt;
@@ -37,6 +39,11 @@ struct DomemasterStereo_ParamsStruct {
   float poles_corr_start;
   float poles_corr_end;
   float neck_offset;
+
+  int start_frame;
+  int end_frame;
+  float separation_anim[SEPARATION_FRAME_COUNT];
+  float parallax_distance_anim[SEPARATION_FRAME_COUNT];
 };
 
 #define CENTERCAM    0
@@ -81,6 +88,9 @@ public:
 		return vrayCameraFlags_empty;
 	}
 
+    float separation_final;
+    float parallax_distance_final;
+
 	void renderBegin(VRayRenderer *vray) {}
 	void renderEnd(VRayRenderer *vray) {}
 	void frameBegin(VR::VRayRenderer *vray);
@@ -109,6 +119,14 @@ void DomemasterStereoImpl::frameBegin(VR::VRayRenderer *vray) {
 	if (filmTrans && filmTrans->params.enabled) {
 		cameraFilmTrans = filmTrans;
 	}
+
+    // get the actual frame number in the chunk
+    int separation_var_number = vray->getFrameData().t - params->start_frame;
+    
+    // store the final version of parameters of for this frame, so we could use this later in other metods
+    const int frameNumberValid=(separation_var_number>=0 && separation_var_number<SEPARATION_FRAME_COUNT);
+    separation_final=frameNumberValid ? params->separation_anim[separation_var_number] : 0.0f;
+    parallax_distance_final=frameNumberValid ? params->parallax_distance_anim[separation_var_number] : 0.0f;
 }
 
 simd::Vector3f DomemasterStereoImpl::getDir(double xs, double ys, int rayVsOrgReturnMode) const {
@@ -132,8 +150,10 @@ simd::Vector3f DomemasterStereoImpl::getDir(double xs, double ys, int rayVsOrgRe
   int stereo_camera = params->camera;
   
   double fov_angle = params->fov_angle * DOME_DTOR;
-  float parallax_distance = params->parallax_distance;
-  float separation = params->separation;
+  // when we really need to use our parameter, instead of reading static params,
+  // we use the previously calculated ones.
+  float parallax_distance = this->parallax_distance_final; // this is keyable
+  float separation = this->separation_final; // this is keyable
   double forward_tilt = params->forward_tilt * DOME_DTOR;
   float tilt_compensation = params->tilt_compensation;
   int vertical_mode = params->vertical_mode;
@@ -143,6 +163,11 @@ simd::Vector3f DomemasterStereoImpl::getDir(double xs, double ys, int rayVsOrgRe
   float poles_corr_start = params->poles_corr_start * DOME_DTOR;
   float poles_corr_end = params->poles_corr_end * DOME_DTOR;
   float neck_offset = params->neck_offset;
+
+  // additional parameters
+  double deltaY = 2.0f * forward_tilt / DOME_PI;
+  double rx2 = -(rx + deltaY);
+  double r2 = sqrt((rx2 * rx2) + (ry * ry));
 
   // check poles correction angles
   if (poles_corr_end < poles_corr_start)
@@ -190,8 +215,27 @@ simd::Vector3f DomemasterStereoImpl::getDir(double xs, double ys, int rayVsOrgRe
       //float separation_mult = params->separation_map;
       //float head_turn_mult = params->head_turn_map;
       //float head_tilt = params->head_tilt_map;
-      
-      float separation_mult = 1.0f;
+
+      float separation_mult = 0.0f;
+      if (r2 >= 0) {
+        // separation_mult = 1.0f * r2 * 10 - 1.5;
+        // separation_mult = (-cos((1.0f * r2 * 5) * DOME_PI) + 1) / 2;
+        separation_mult = 1.0f * r2 * 5;
+        if (r2 > 0.20) {
+          separation_mult = 1.0f;
+        }
+      }
+
+      float separation_mult_zenith = 0.0f;
+      if (r >= 0) {
+        // separation_mult = 1.0f * r2 * 10 - 1.5;
+        // separation_mult = (-cos((1.0f * r2 * 5) * DOME_PI) + 1) / 2;
+        separation_mult_zenith = 1.0f * r * 5;
+        if (r > 0.20) {
+          separation_mult_zenith = 1.0f;
+        }
+      }
+
       float separation_mult_auto = 1.0f;
       float head_turn_mult = 1.0f;
       float head_tilt = 0.5f;
@@ -220,6 +264,7 @@ simd::Vector3f DomemasterStereoImpl::getDir(double xs, double ys, int rayVsOrgRe
       separation_mult *= separation_mult_auto;
     
       // camera selection and initial position
+      // use the keyable separation
       if (stereo_camera == LEFTCAM) {
         org.x = (float)(-separation * separation_mult / 2.0);
       }
@@ -428,6 +473,81 @@ struct DomemasterStereo_Params: VRayParameterListDesc {
 	addParamFloat("poles_corr_start", 45.f, -1, "Poles Correction Start Angle");
 	addParamFloat("poles_corr_end", 85.f, -1, "Poles Correction End Angle");
     addParamFloat("neck_offset", 0.0f, -1, "Neck Offset");
+
+    // For the plugin parameters, they cannot be animated if rendered in chunks bigger than 1 frame.
+    // The domemaster3D plugin always reads the value from the first frame in chunk
+    // To be able to read the correct value for each frame in the chunk for the parameter, it needs to be
+    // explicity enumerated.
+    // for our needs, we had two parameters we wanted to animate: Separation and Paralax Distance.
+    // To be able to get the actual frame number in chunk,
+    // we had to pass the first frame in the chunk and last frame in the chunk as the arameters
+    addParamInt("start_frame", 0, -1, "Frame Start");
+    addParamInt("end_frame", 0, -1, "Frame End");
+
+    // Also for each frame in the chunk we created a parameter for its Separation, and Paralax Distance
+    // The Separation parameters:
+    addParamFloat("separation_0", 0.0f, -1, "Separation_0");
+    addParamFloat("separation_1", 0.0f, -1, "Separation_1");
+    addParamFloat("separation_2", 0.0f, -1, "Separation_2");
+    addParamFloat("separation_3", 0.0f, -1, "Separation_3");
+    addParamFloat("separation_4", 0.0f, -1, "Separation_4");
+    addParamFloat("separation_5", 0.0f, -1, "Separation_5");
+    addParamFloat("separation_6", 0.0f, -1, "Separation_6");
+    addParamFloat("separation_7", 0.0f, -1, "Separation_7");
+    addParamFloat("separation_8", 0.0f, -1, "Separation_8");
+    addParamFloat("separation_9", 0.0f, -1, "Separation_9");
+    addParamFloat("separation_10", 0.0f, -1, "Separation_10");
+    addParamFloat("separation_11", 0.0f, -1, "Separation_11");
+    addParamFloat("separation_12", 0.0f, -1, "Separation_12");
+    addParamFloat("separation_13", 0.0f, -1, "Separation_13");
+    addParamFloat("separation_14", 0.0f, -1, "Separation_14");
+    addParamFloat("separation_15", 0.0f, -1, "Separation_15");
+    addParamFloat("separation_16", 0.0f, -1, "Separation_16");
+    addParamFloat("separation_17", 0.0f, -1, "Separation_17");
+    addParamFloat("separation_18", 0.0f, -1, "Separation_18");
+    addParamFloat("separation_19", 0.0f, -1, "Separation_19");
+    addParamFloat("separation_20", 0.0f, -1, "Separation_20");
+    addParamFloat("separation_21", 0.0f, -1, "Separation_21");
+    addParamFloat("separation_22", 0.0f, -1, "Separation_22");
+    addParamFloat("separation_23", 0.0f, -1, "Separation_23");
+    addParamFloat("separation_24", 0.0f, -1, "Separation_24");
+    addParamFloat("separation_25", 0.0f, -1, "Separation_25");
+    addParamFloat("separation_26", 0.0f, -1, "Separation_26");
+    addParamFloat("separation_27", 0.0f, -1, "Separation_27");
+    addParamFloat("separation_28", 0.0f, -1, "Separation_28");
+    addParamFloat("separation_29", 0.0f, -1, "Separation_29");
+
+    // The Parallax Distance Parameters
+    addParamFloat("parallax_distance_0", 0.0f, -1, "parallax_distance_0");
+    addParamFloat("parallax_distance_1", 0.0f, -1, "parallax_distance_1");
+    addParamFloat("parallax_distance_2", 0.0f, -1, "parallax_distance_2");
+    addParamFloat("parallax_distance_3", 0.0f, -1, "parallax_distance_3");
+    addParamFloat("parallax_distance_4", 0.0f, -1, "parallax_distance_4");
+    addParamFloat("parallax_distance_5", 0.0f, -1, "parallax_distance_5");
+    addParamFloat("parallax_distance_6", 0.0f, -1, "parallax_distance_6");
+    addParamFloat("parallax_distance_7", 0.0f, -1, "parallax_distance_7");
+    addParamFloat("parallax_distance_8", 0.0f, -1, "parallax_distance_8");
+    addParamFloat("parallax_distance_9", 0.0f, -1, "parallax_distance_9");
+    addParamFloat("parallax_distance_10", 0.0f, -1, "parallax_distance_10");
+    addParamFloat("parallax_distance_11", 0.0f, -1, "parallax_distance_11");
+    addParamFloat("parallax_distance_12", 0.0f, -1, "parallax_distance_12");
+    addParamFloat("parallax_distance_13", 0.0f, -1, "parallax_distance_13");
+    addParamFloat("parallax_distance_14", 0.0f, -1, "parallax_distance_14");
+    addParamFloat("parallax_distance_15", 0.0f, -1, "parallax_distance_15");
+    addParamFloat("parallax_distance_16", 0.0f, -1, "parallax_distance_16");
+    addParamFloat("parallax_distance_17", 0.0f, -1, "parallax_distance_17");
+    addParamFloat("parallax_distance_18", 0.0f, -1, "parallax_distance_18");
+    addParamFloat("parallax_distance_19", 0.0f, -1, "parallax_distance_19");
+    addParamFloat("parallax_distance_20", 0.0f, -1, "parallax_distance_20");
+    addParamFloat("parallax_distance_21", 0.0f, -1, "parallax_distance_21");
+    addParamFloat("parallax_distance_22", 0.0f, -1, "parallax_distance_22");
+    addParamFloat("parallax_distance_23", 0.0f, -1, "parallax_distance_23");
+    addParamFloat("parallax_distance_24", 0.0f, -1, "parallax_distance_24");
+    addParamFloat("parallax_distance_25", 0.0f, -1, "parallax_distance_25");
+    addParamFloat("parallax_distance_26", 0.0f, -1, "parallax_distance_26");
+    addParamFloat("parallax_distance_27", 0.0f, -1, "parallax_distance_27");
+    addParamFloat("parallax_distance_28", 0.0f, -1, "parallax_distance_28");
+    addParamFloat("parallax_distance_29", 0.0f, -1, "parallax_distance_29");
 	}
 };
 
@@ -456,6 +576,68 @@ public:
     paramList->setParamCache("poles_corr_start", &params.poles_corr_start);
     paramList->setParamCache("poles_corr_end", &params.poles_corr_end);
     paramList->setParamCache("neck_offset", &params.neck_offset);
+    paramList->setParamCache("start_frame", &params.start_frame);
+    paramList->setParamCache("end_frame", &params.end_frame);
+    paramList->setParamCache("separation_0", &params.separation_anim[0]);
+    paramList->setParamCache("separation_1", &params.separation_anim[1]);
+    paramList->setParamCache("separation_2", &params.separation_anim[2]);
+    paramList->setParamCache("separation_3", &params.separation_anim[3]);
+    paramList->setParamCache("separation_4", &params.separation_anim[4]);
+    paramList->setParamCache("separation_5", &params.separation_anim[5]);
+    paramList->setParamCache("separation_6", &params.separation_anim[6]);
+    paramList->setParamCache("separation_7", &params.separation_anim[7]);
+    paramList->setParamCache("separation_8", &params.separation_anim[8]);
+    paramList->setParamCache("separation_9", &params.separation_anim[9]);
+    paramList->setParamCache("separation_10", &params.separation_anim[10]);
+    paramList->setParamCache("separation_11", &params.separation_anim[11]);
+    paramList->setParamCache("separation_12", &params.separation_anim[12]);
+    paramList->setParamCache("separation_13", &params.separation_anim[13]);
+    paramList->setParamCache("separation_14", &params.separation_anim[14]);
+    paramList->setParamCache("separation_15", &params.separation_anim[15]);
+    paramList->setParamCache("separation_16", &params.separation_anim[16]);
+    paramList->setParamCache("separation_17", &params.separation_anim[17]);
+    paramList->setParamCache("separation_18", &params.separation_anim[18]);
+    paramList->setParamCache("separation_19", &params.separation_anim[19]);
+    paramList->setParamCache("separation_20", &params.separation_anim[20]);
+    paramList->setParamCache("separation_21", &params.separation_anim[21]);
+    paramList->setParamCache("separation_22", &params.separation_anim[22]);
+    paramList->setParamCache("separation_23", &params.separation_anim[23]);
+    paramList->setParamCache("separation_24", &params.separation_anim[24]);
+    paramList->setParamCache("separation_25", &params.separation_anim[25]);
+    paramList->setParamCache("separation_26", &params.separation_anim[26]);
+    paramList->setParamCache("separation_27", &params.separation_anim[27]);
+    paramList->setParamCache("separation_28", &params.separation_anim[28]);
+    paramList->setParamCache("separation_29", &params.separation_anim[29]);
+    paramList->setParamCache("parallax_distance_0", &params.parallax_distance_anim[0]);
+    paramList->setParamCache("parallax_distance_1", &params.parallax_distance_anim[1]);
+    paramList->setParamCache("parallax_distance_2", &params.parallax_distance_anim[2]);
+    paramList->setParamCache("parallax_distance_3", &params.parallax_distance_anim[3]);
+    paramList->setParamCache("parallax_distance_4", &params.parallax_distance_anim[4]);
+    paramList->setParamCache("parallax_distance_5", &params.parallax_distance_anim[5]);
+    paramList->setParamCache("parallax_distance_6", &params.parallax_distance_anim[6]);
+    paramList->setParamCache("parallax_distance_7", &params.parallax_distance_anim[7]);
+    paramList->setParamCache("parallax_distance_8", &params.parallax_distance_anim[8]);
+    paramList->setParamCache("parallax_distance_9", &params.parallax_distance_anim[9]);
+    paramList->setParamCache("parallax_distance_10", &params.parallax_distance_anim[10]);
+    paramList->setParamCache("parallax_distance_11", &params.parallax_distance_anim[11]);
+    paramList->setParamCache("parallax_distance_12", &params.parallax_distance_anim[12]);
+    paramList->setParamCache("parallax_distance_13", &params.parallax_distance_anim[13]);
+    paramList->setParamCache("parallax_distance_14", &params.parallax_distance_anim[14]);
+    paramList->setParamCache("parallax_distance_15", &params.parallax_distance_anim[15]);
+    paramList->setParamCache("parallax_distance_16", &params.parallax_distance_anim[16]);
+    paramList->setParamCache("parallax_distance_17", &params.parallax_distance_anim[17]);
+    paramList->setParamCache("parallax_distance_18", &params.parallax_distance_anim[18]);
+    paramList->setParamCache("parallax_distance_19", &params.parallax_distance_anim[19]);
+    paramList->setParamCache("parallax_distance_20", &params.parallax_distance_anim[20]);
+    paramList->setParamCache("parallax_distance_21", &params.parallax_distance_anim[21]);
+    paramList->setParamCache("parallax_distance_22", &params.parallax_distance_anim[22]);
+    paramList->setParamCache("parallax_distance_23", &params.parallax_distance_anim[23]);
+    paramList->setParamCache("parallax_distance_24", &params.parallax_distance_anim[24]);
+    paramList->setParamCache("parallax_distance_25", &params.parallax_distance_anim[25]);
+    paramList->setParamCache("parallax_distance_26", &params.parallax_distance_anim[26]);
+    paramList->setParamCache("parallax_distance_27", &params.parallax_distance_anim[27]);
+    paramList->setParamCache("parallax_distance_28", &params.parallax_distance_anim[28]);
+    paramList->setParamCache("parallax_distance_29", &params.parallax_distance_anim[29]);
 	}
 
 	// From RenderSettingsExtension
